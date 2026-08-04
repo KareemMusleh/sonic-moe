@@ -213,6 +213,7 @@ cython_debug/
 /scratchpad/
 *.ncu-rep
 /core
+/driver.sh
 
 # Local environments
 /.venv-*/

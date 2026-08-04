@@ -19,6 +19,7 @@ Two env shims (isolated to this script; the ydt source is untouched):
 
 import sys
 import types
+from pathlib import Path
 
 _dist = types.ModuleType("ydt_core.distributed")
 _dist.__path__ = []
@@ -28,7 +29,6 @@ sys.modules["ydt_core.distributed"] = _dist
 sys.modules["ydt_core.distributed.activation_checkpointing"] = _ac
 
 import torch
-from torch.profiler import ProfilerActivity, profile
 
 if not hasattr(torch.nn.functional, "grouped_mm"):
     torch.nn.functional.grouped_mm = torch._grouped_mm
@@ -36,9 +36,11 @@ if not hasattr(torch.nn.functional, "grouped_mm"):
 from ydt_core.fp8.permute import aligned_permute, aligned_unpermute
 from ydt_core.fp8.swiglu import TMA_ALIGN, moe_swiglu
 from ydt_core.fp8.tensor import FP8BlockwiseTensor
+from trace_benchmark_utils import print_profile_report, profile_cuda
 
 # Match fp8_trace.py: T, H, I, E, K = 32768, 4096, 1024, 512, 10
 T, H, I, E, K = 8192, 4096, 1024, 512 // 8, 10
+PROFILE_ITERATIONS = 10
 torch.manual_seed(0)
 device = "cuda"
 
@@ -103,22 +105,14 @@ for _ in range(20):  # warmup: compile + autotune
     fwd_bwd()
 torch.cuda.synchronize()
 
-with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-    for _ in range(10):
-        fwd()
-    torch.cuda.synchronize()
-
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
-trace = "scratchpad/ydt_moe_fwd_trace.json"
-prof.export_chrome_trace(trace)
-print("\nchrome trace:", trace)
-
-with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-    for _ in range(10):
-        fwd_bwd()
-    torch.cuda.synchronize()
-
-print("\n" + prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
-trace = "scratchpad/ydt_moe_fwd_bwd_trace.json"
-prof.export_chrome_trace(trace)
-print("\nchrome trace:", trace)
+for title, target, trace in (
+    ("Forward", fwd, Path("scratchpad/ydt_moe_fwd_trace.json")),
+    ("Forward + backward", fwd_bwd, Path("scratchpad/ydt_moe_fwd_bwd_trace.json")),
+):
+    prof, peak_memory, memory_snapshot = profile_cuda(
+        target,
+        trace,
+        iterations=PROFILE_ITERATIONS,
+        cold_l2=True,
+    )
+    print_profile_report(title, prof, trace, memory_snapshot, peak_memory)

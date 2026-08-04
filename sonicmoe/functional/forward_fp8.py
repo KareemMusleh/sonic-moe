@@ -19,7 +19,10 @@ from ..enums import ActivationType, is_glu
 from .backward import TC_Softmax_Topk_Router_Function
 from .backward_fp8 import _DownProjectionFP8, _UpProjectionFP8
 from .fp8_tensor import FP8BlockwiseTensor
-from .triton_kernels import TC_topk_router_metadata_triton
+from .triton_kernels import (
+    TC_topk_router_metadata_triton,
+    general_routing_router_metadata_triton,
+)
 
 _SF = 128  # SM90 K-block / dQaccum row-pad granularity
 
@@ -27,15 +30,16 @@ _SF = 128  # SM90 K-block / dQaccum row-pad granularity
 def moe_TC_softmax_topk_layer_fp8(
     x: torch.Tensor,  # (T, H) bf16 — always full precision (router + weight-grad GEMM)
     router_w: torch.Tensor,  # (E, H)
-    w1: torch.Tensor | FP8BlockwiseTensor,  # c_fc.weight: (E, 2*I, H) [N=2I, K=H], interleaved [gate, up]
+    w1: torch.Tensor
+    | FP8BlockwiseTensor,  # c_fc.weight: (E, 2*I, H) [N=2I, K=H], interleaved [gate, up]
     w2: torch.Tensor | FP8BlockwiseTensor,  # c_proj.weight: (E, H, I) [N=H, K=I]
     K: int,
     activation_type: ActivationType,
     is_softmax_over_topk: bool = True,
     norm_topk_probs: bool = False,
-    concat_layout: bool = False,
     is_inference_mode: bool = False,
-    x_fp8: FP8BlockwiseTensor | None = None,  # optional pre-quantized activations for the up GEMM
+    x_fp8: FP8BlockwiseTensor
+    | None = None,  # optional pre-quantized activations for the up GEMM
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """MXFP8 blockscaled MoE. Returns (output (T, H), router_logits, expert_frequency).
 
@@ -51,12 +55,13 @@ def moe_TC_softmax_topk_layer_fp8(
     optimization only) — the caller must not call `.backward()` through the output
     when it's True.
     """
-    assert is_glu(activation_type), "fp8 MoE only supports GLU activations (QuACK gated GEMM)"
-    assert not (concat_layout and isinstance(w1, FP8BlockwiseTensor)), (
-        "concat_layout is not supported with pre-quantized FP8BlockwiseTensor weights"
+    assert is_glu(activation_type), (
+        "fp8 MoE only supports GLU activations (QuACK gated GEMM)"
     )
     if x_fp8 is not None:
-        assert x_fp8._quant_block_size == (1, _SF), "x_fp8 must be a 1x128 activation quant"
+        assert x_fp8._quant_block_size == (1, _SF), (
+            "x_fp8 must be a 1x128 activation quant"
+        )
     E, N1, H = w1.shape
     assert N1 % 2 == 0
     I = N1 // 2
@@ -107,8 +112,8 @@ def moe_TC_softmax_topk_layer_fp8(
         T,
         TK,
         K,
+        None,
         activation_type,
-        concat_layout,
         is_inference_mode,
         x_fp8,
     )
@@ -127,7 +132,118 @@ def moe_TC_softmax_topk_layer_fp8(
         total_padded_M,
         T,
         K,
+        None,
         activation_type,
     )
 
     return o, router_logits, expert_frequency
+
+
+def moe_general_routing_inputs_fp8(
+    x: torch.Tensor,
+    router_scores: torch.Tensor,
+    token_indices: torch.Tensor,
+    expert_indices: torch.Tensor,
+    w1: torch.Tensor | FP8BlockwiseTensor,
+    w2: torch.Tensor | FP8BlockwiseTensor,
+    E: int,
+    activation_type: ActivationType,
+    is_inference_mode: bool = False,
+    x_fp8: FP8BlockwiseTensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8 SM90 MoE with an externally supplied sparse routing graph.
+
+    ``token_indices``, ``expert_indices``, and ``router_scores`` describe the
+    surviving token-to-expert assignments. Token indices must be sorted in
+    ascending order, but tokens may have any number of assignments, including
+    zero. Capacity enforcement and assignment dropping are the caller's job.
+    """
+    assert is_glu(activation_type), "fp8 MoE only supports GLU activations"
+    assert token_indices.ndim == expert_indices.ndim == router_scores.ndim == 1
+    assert token_indices.numel() == expert_indices.numel() == router_scores.numel()
+    assert token_indices.numel() > 0, (
+        "general-routing FP8 requires at least one assignment"
+    )
+    assert token_indices.dtype == torch.int32 and expert_indices.dtype == torch.int32
+    assert (
+        token_indices.device
+        == expert_indices.device
+        == router_scores.device
+        == x.device
+    )
+    assert w1.shape[0] == w2.shape[0] == E
+
+    if router_scores.dtype != torch.float32:
+        router_scores = router_scores.float()
+
+    T, H = x.shape
+    TK = router_scores.numel()
+    _, N1, H1 = w1.shape
+    I = N1 // 2
+    assert H1 == H and N1 % 2 == 0
+    assert H % _SF == 0 and I % _SF == 0
+    assert w2.shape == (E, H, I)
+    if x_fp8 is not None:
+        assert x_fp8._quant_block_size == (1, _SF)
+
+    device = x.device
+    s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
+    expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
+    x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    token_frequency_offset = torch.empty(T + 1, dtype=torch.int32, device=device)
+    total_padded_M = dqaccum_total_padded_m(TK, E)
+    padded_gather_idx = torch.empty(total_padded_M, dtype=torch.int32, device=device)
+    padded_grouped_idx = torch.empty(total_padded_M, dtype=torch.int32, device=device)
+
+    general_routing_router_metadata_triton(
+        token_indices,
+        expert_indices,
+        T,
+        E,
+        expert_frequency,
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        token_frequency_offset,
+        padded_gather_idx,
+        padded_grouped_idx,
+    )
+
+    a, h = _UpProjectionFP8.apply(
+        x,
+        w1,
+        expert_frequency_offset,
+        x_gather_idx,
+        s_reverse_scatter_idx,
+        padded_gather_idx,
+        padded_grouped_idx,
+        total_padded_M,
+        T,
+        TK,
+        None,
+        token_frequency_offset,
+        activation_type,
+        is_inference_mode,
+        x_fp8,
+    )
+    o = _DownProjectionFP8.apply(
+        a,
+        h,
+        w2,
+        router_scores,
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        padded_gather_idx,
+        padded_grouped_idx,
+        total_padded_M,
+        T,
+        None,
+        token_frequency_offset,
+        activation_type,
+    )
+    return o, expert_frequency

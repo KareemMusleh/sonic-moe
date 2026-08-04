@@ -38,7 +38,12 @@ from .fp8_tensor import FP8BlockwiseTensor
 from .triton_kernels import gather_padded_sfa
 
 _GATHER_CONFIG = GemmConfig(
-    tile_m=128, tile_n=256, cluster_m=2, cluster_n=1, pingpong=False, is_dynamic_persistent=False
+    tile_m=128,
+    tile_n=256,
+    cluster_m=2,
+    cluster_n=1,
+    pingpong=False,
+    is_dynamic_persistent=False,
 )
 
 
@@ -75,13 +80,6 @@ def _weight_grad_dtype(w: torch.Tensor | FP8BlockwiseTensor) -> torch.dtype:
     return w._grad_dtype if isinstance(w, FP8BlockwiseTensor) else w.dtype
 
 
-def _to_interleaved_from_concat(w: torch.Tensor, I: int) -> torch.Tensor:
-    """(..., 2I, H) concat [gate(I); up(I)] -> interleaved [gate0, up0, gate1, up1, ...]."""
-    gate, up = w[..., :I, :], w[..., I:, :]
-    stacked = torch.stack((gate, up), dim=-2)  # (..., I, 2, H)
-    return stacked.reshape(*w.shape[:-2], 2 * I, w.shape[-1])
-
-
 class _UpProjectionFP8(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -96,11 +94,12 @@ class _UpProjectionFP8(torch.autograd.Function):
         total_padded_M: int,
         T: int,
         TK: int,
-        K: int,
+        K: int | None,
+        num_activated_expert_per_token_offset: torch.Tensor | None,
         activation_type: ActivationType,
-        concat_layout: bool,
         is_inference_mode: bool,
-        x_fp8: FP8BlockwiseTensor | None,  # pre-quantized activations, or None to quantize x here
+        x_fp8: FP8BlockwiseTensor
+        | None,  # pre-quantized activations, or None to quantize x here
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         E, N1, H = w1.shape
         I = N1 // 2
@@ -111,10 +110,14 @@ class _UpProjectionFP8(torch.autograd.Function):
         else:
             x_q, x_sc = quantize_act(x)
         w1_q, w1_sc = _weight_fwd_qsc(w1)
-        B1, B1_sc = w1_q.mT, w1_sc.mT
         sfa_up = gather_padded_sfa(x_sc, padded_gather_idx, total_padded_M)
+        B1, B1_sc = w1_q.mT, w1_sc.mT
+        h = (
+            torch.empty(TK, 2 * I, dtype=x.dtype, device=device)
+            if not is_inference_mode
+            else None
+        )
         a = torch.empty(TK, I, dtype=x.dtype, device=device)
-        h = torch.empty(TK, 2 * I, dtype=x.dtype, device=device) if not is_inference_mode else None
         mxfp8_gemm_gated_tuned_sm90.fn(
             x_q,
             B1,
@@ -129,41 +132,44 @@ class _UpProjectionFP8(torch.autograd.Function):
             x_gather_idx,
             False,
             config=_GATHER_CONFIG,
-            concat_layout=("B",) if concat_layout else None,
         )
 
         # Store the forward-layout weight quant (fp8) — the backward transposes it
-        # instead of re-quantizing (~1.25x faster). Only concat_layout still needs the
-        # bf16 weight, to re-interleave + re-quantize (a transpose can't reorder rows).
+        # instead of re-quantizing (~1.25x faster).
+        ctx.T = T
+        ctx.K = K
+        ctx.E = E
+        ctx.H = H
+        ctx.total_padded_M = total_padded_M
+        ctx.w1_grad_dtype = _weight_grad_dtype(w1)
         ctx.save_for_backward(
             x,
             w1_q,
             w1_sc,
-            w1 if concat_layout else None,
             expert_frequency_offset,
             x_gather_idx,
             s_reverse_scatter_idx,
             padded_grouped_idx,
+            num_activated_expert_per_token_offset,
         )
-        ctx.T = T
-        ctx.K = K
-        ctx.H = H
-        ctx.I = I
-        ctx.total_padded_M = total_padded_M
-        ctx.concat_layout = concat_layout
-        ctx.w1_grad_dtype = _weight_grad_dtype(w1)
         ctx.mark_non_differentiable(a)
         ctx.set_materialize_grads(False)
         return a, h
 
     @staticmethod
     def backward(ctx, _: None, dh: torch.Tensor):
-        (x, w1_q, w1_sc, w1_concat, expert_frequency_offset, x_gather_idx, s_reverse_scatter_idx, padded_grouped_idx) = (
-            ctx.saved_tensors
-        )
-        T, K, H, I = ctx.T, ctx.K, ctx.H, ctx.I
+        (
+            x,
+            w1_q,
+            w1_sc,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_reverse_scatter_idx,
+            padded_grouped_idx,
+            num_activated_expert_per_token_offset,
+        ) = ctx.saved_tensors
+        T, K, E, H = ctx.T, ctx.K, ctx.E, ctx.H
         total_padded_M = ctx.total_padded_M
-        concat_layout = ctx.concat_layout
         device = dh.device
 
         dh = dh.contiguous()
@@ -171,14 +177,7 @@ class _UpProjectionFP8(torch.autograd.Function):
         # ── activations grad (fp8 GG): dx_expanded = dh @ w1 ──────────────────
         dh_q, dh_sc = quantize_act(dh)
         sfa_dx = gather_padded_sfa(dh_sc, padded_grouped_idx, total_padded_M)
-        if concat_layout:
-            # concat weight's backward needs the *interleaved*-layout transposed quant,
-            # which a transpose of the concat-layout forward quant can't produce.
-            w1_bwd_q, w1_bwd_sc = quantize_weight_sm90(
-                _to_interleaved_from_concat(w1_concat, I), transpose=True
-            )
-        else:
-            w1_bwd_q, w1_bwd_sc = _transpose_weight_qsc(w1_q, w1_sc)
+        w1_bwd_q, w1_bwd_sc = _transpose_weight_qsc(w1_q, w1_sc)
         B1_bwd, B1_bwd_sc = w1_bwd_q.mT, w1_bwd_sc.mT  # (E, 2I, H) K(2I)-contig
 
         _, dx_expanded = mxfp8_gemm_act_sm90(
@@ -194,16 +193,23 @@ class _UpProjectionFP8(torch.autograd.Function):
             tuned=False,
         )  # (TK, H)
 
+        # These are only inputs to the activation-gradient GEMM.  Drop their
+        # storage before allocating the reduced activation and dense weight
+        # gradients below.
+        del dh_q, dh_sc, sfa_dx
+        del B1_bwd, B1_bwd_sc, w1_bwd_q, w1_bwd_sc
+
         dx_reduced = torch.empty(T, H, dtype=dh.dtype, device=device)
         _token_broadcast_backward(
             dx_reduced=dx_reduced,
             dx_expanded=dx_expanded,
             s_reverse_scatter_idx=s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset=None,
-            varlen_K_max=K,
+            num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
+            varlen_K_max=E if K is None else K,
             H=H,
-            is_varlen_K=False,
+            is_varlen_K=K is None,
         )
+        del dx_expanded
 
         # ── weight grad (bf16 GG): dw1 = dh^T @ x, per-expert grouped ─────────
         dw1 = torch.empty(w1_q.shape, dtype=ctx.w1_grad_dtype, device=device)
@@ -215,7 +221,6 @@ class _UpProjectionFP8(torch.autograd.Function):
             A_idx=x_gather_idx,
             batch_idx_permute=None,
             dynamic_scheduler=False,
-            concat_layout=(("out",) if concat_layout else None),
         )
 
         # trailing None grads: (..., x_fp8). dw1 is routed to the wrapper weight and,
@@ -227,7 +232,7 @@ class _DownProjectionFP8(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        a: torch.Tensor,  # (TK, I) bf16 postact
+        a: torch.Tensor | FP8BlockwiseTensor,  # (TK, I) postact
         h: torch.Tensor,  # (TK, 2I) bf16 preact (from the up-projection)
         w2: torch.Tensor,  # (E, H, I) bf16 or FP8BlockwiseTensor
         topk_scores: torch.Tensor,  # (T, K) float32
@@ -239,17 +244,21 @@ class _DownProjectionFP8(torch.autograd.Function):
         padded_grouped_idx: torch.Tensor,  # (total_padded_M,) grouped-order -> padded row
         total_padded_M: int,
         T: int,
-        K: int,
+        K: int | None,
+        num_activated_expert_per_token_offset: torch.Tensor | None,
         activation_type: ActivationType,
     ) -> torch.Tensor:
-        TK = a.size(0)
         E, H, I = w2.shape
         device = a.device
 
         w2_q, w2_sc = _weight_fwd_qsc(w2)
         B2, B2_sc = w2_q.mT, w2_sc.mT
 
-        a_q, a_sc = quantize_act(a)
+        if isinstance(a, FP8BlockwiseTensor):
+            assert a._quant_block_size == (1, 128)
+            a_q, a_sc = a._data, a._scale
+        else:
+            a_q, a_sc = quantize_act(a)
         sfa_down = gather_padded_sfa(a_sc, padded_grouped_idx, total_padded_M)
         _, y = mxfp8_gemm_act_sm90(
             a_q,
@@ -264,6 +273,8 @@ class _DownProjectionFP8(torch.autograd.Function):
             tuned=False,
         )  # (TK, H), expert-grouped, pre-combine
 
+        del a_q, a_sc, sfa_down, B2, B2_sc
+
         o = torch.empty(T, H, device=device, dtype=a.dtype)
         topk_scores_flat = topk_scores.reshape(-1)
         _router_forward(
@@ -271,15 +282,22 @@ class _DownProjectionFP8(torch.autograd.Function):
             o=o,
             topk_scores=topk_scores_flat,
             s_reverse_scatter_idx=s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset=None,
-            varlen_K_max=K,
+            num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
+            varlen_K_max=E if K is None else K,
             H=H,
-            is_varlen_K=False,
+            is_varlen_K=K is None,
         )
 
         # Store the forward-layout weight quant (fp8); the backward transposes it.
         ctx.save_for_backward(
-            h, w2_q, w2_sc, topk_scores_flat, expert_frequency_offset, x_gather_idx, s_scatter_idx, padded_gather_idx
+            h,
+            w2_q,
+            w2_sc,
+            topk_scores_flat,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            padded_gather_idx,
         )
         ctx.T = T
         ctx.K = K
@@ -290,9 +308,16 @@ class _DownProjectionFP8(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
-        (h, w2_q, w2_sc, topk_scores, expert_frequency_offset, x_gather_idx, s_scatter_idx, padded_gather_idx) = (
-            ctx.saved_tensors
-        )
+        (
+            h,
+            w2_q,
+            w2_sc,
+            topk_scores,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            padded_gather_idx,
+        ) = ctx.saved_tensors
         T, K = ctx.T, ctx.K
         total_padded_M = ctx.total_padded_M
         activation_type = ctx.activation_type
@@ -327,6 +352,11 @@ class _DownProjectionFP8(torch.autograd.Function):
             config=_GATHER_CONFIG,
         )
 
+        # The activation-gradient GEMM has consumed these quantized operands.
+        # Release them before allocating the dense bf16 weight gradient.
+        del dout_q, dout_sc, sfa_da, s
+        del B2_bwd, B2_bwd_sc, w2_bwd_q, w2_bwd_sc
+
         # ── weight grad (bf16 GG): dw2 = dout^T @ a_prime, per-expert grouped ──
         dw2 = torch.empty(w2_q.shape, dtype=ctx.w2_grad_dtype, device=device)
         gemm(
@@ -338,9 +368,11 @@ class _DownProjectionFP8(torch.autograd.Function):
             batch_idx_permute=None,
             dynamic_scheduler=False,
         )
+        del a_prime
 
         ds = torch.empty_like(topk_scores)
         ds[s_scatter_idx.long()] = ds_partial.to(ds.dtype)
-        ds = ds.view(T, K)
+        if K is not None:
+            ds = ds.view(T, K)
 
-        return None, dh, dw2, ds, None, None, None, None, None, None, None, None, None, None
+        return None, dh, dw2, ds, *[None] * 11

@@ -7,7 +7,11 @@ import torch
 import triton
 import triton.language as tl
 
-from .bitmatrix import _bitmatrix_metadata_compute_stage1, _bitmatrix_metadata_compute_stage2, _keyed_add
+from .bitmatrix import (
+    _bitmatrix_metadata_compute_stage1,
+    _bitmatrix_metadata_compute_stage2,
+    _keyed_add,
+)
 
 
 @triton.jit
@@ -204,6 +208,8 @@ def _general_metadata_compute_stage2(
     s_scatter_idx_ptr,
     s_reverse_scatter_idx_ptr,
     x_gather_idx_ptr,
+    padded_gather_idx_ptr,
+    padded_grouped_idx_ptr,
     selected_E_ptr,
     sorted_selected_T_ptr,
     TK,
@@ -211,6 +217,7 @@ def _general_metadata_compute_stage2(
     n_tiles,
     expert_offs_ptr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_PADDED: tl.constexpr,
 ):
     tl.static_assert(BLOCK_SIZE <= 32768)
 
@@ -234,8 +241,11 @@ def _general_metadata_compute_stage2(
     within_expert_rank = (inclusive_run_lengths - 1) & 0xFFFF
 
     # Output position = expert_offs[e] + partial_sum[tile, e] + within_expert_rank.
-    s_reverse_scatter_val = tl.load(partial_sum_ptr + pid_m + expert * n_tiles, mask=mask)
-    s_reverse_scatter_val += tl.load(expert_offs_ptr + expert, mask=mask)
+    expert_off = tl.load(expert_offs_ptr + expert, mask=mask)
+    s_reverse_scatter_val = tl.load(
+        partial_sum_ptr + pid_m + expert * n_tiles, mask=mask
+    )
+    s_reverse_scatter_val += expert_off
     s_reverse_scatter_val += within_expert_rank
 
     # Recover pre-sort entry index and look up the token index.
@@ -246,6 +256,12 @@ def _general_metadata_compute_stage2(
     tl.store(s_reverse_scatter_idx_ptr + entry_idx, s_reverse_scatter_val, mask=mask)
     tl.store(s_scatter_idx_ptr + s_reverse_scatter_val, entry_idx, mask=mask)
     tl.store(x_gather_idx_ptr + s_reverse_scatter_val, token_idx, mask=mask)
+    if HAS_PADDED:
+        padded_row = (expert_off // 128 + expert.to(tl.int32)) * 128 + (
+            s_reverse_scatter_val - expert_off
+        )
+        tl.store(padded_gather_idx_ptr + padded_row, token_idx, mask=mask)
+        tl.store(padded_grouped_idx_ptr + padded_row, s_reverse_scatter_val, mask=mask)
 
 
 # ── general_routing_router_metadata_triton --- Kernel 4: parallel binary search for token offset ─────────────────────────
@@ -293,9 +309,11 @@ def _token_offset_searchsorted_kernel(
         "s_scatter_idx",
         "s_reverse_scatter_idx",
         "num_activated_expert_per_token_offset",
+        "padded_gather_idx",
+        "padded_grouped_idx",
     },
 )
-def general_routing_router_metadata_triton(
+def _general_routing_router_metadata_triton(
     sorted_selected_T: torch.Tensor,
     selected_E: torch.Tensor,
     T: int,
@@ -306,6 +324,8 @@ def general_routing_router_metadata_triton(
     s_scatter_idx: torch.Tensor,
     s_reverse_scatter_idx: torch.Tensor,
     num_activated_expert_per_token_offset: torch.Tensor,
+    padded_gather_idx: torch.Tensor | None,
+    padded_grouped_idx: torch.Tensor | None,
 ) -> None:
     TK = selected_E.size(0)
     device = selected_E.device
@@ -341,10 +361,14 @@ def general_routing_router_metadata_triton(
     )
 
     # ── Kernel 3: stage2 ─────────────────────────────────────────────────
+    has_padded = padded_gather_idx is not None
+    assert has_padded == (padded_grouped_idx is not None)
     _general_metadata_compute_stage2[(n_tiles,)](
         s_scatter_idx,
         s_reverse_scatter_idx,
         x_gather_idx,
+        padded_gather_idx if has_padded else x_gather_idx,
+        padded_grouped_idx if has_padded else x_gather_idx,
         selected_E,
         sorted_selected_T,
         TK,
@@ -352,6 +376,7 @@ def general_routing_router_metadata_triton(
         n_tiles,
         expert_frequency_offset[:E],
         BLOCK_SIZE=BLOCK_SIZE,
+        HAS_PADDED=has_padded,
     )
 
     # ── Kernel 4: num_activated_expert_per_token_offset via searchsorted ──
@@ -367,6 +392,37 @@ def general_routing_router_metadata_triton(
         TK,
         BLOCK_SIZE=TOKEN_BLOCK,
         N_ITERS=N_ITERS,
+    )
+
+
+def general_routing_router_metadata_triton(
+    sorted_selected_T: torch.Tensor,
+    selected_E: torch.Tensor,
+    T: int,
+    E: int,
+    expert_frequency: torch.Tensor,
+    expert_frequency_offset: torch.Tensor,
+    x_gather_idx: torch.Tensor,
+    s_scatter_idx: torch.Tensor,
+    s_reverse_scatter_idx: torch.Tensor,
+    num_activated_expert_per_token_offset: torch.Tensor,
+    padded_gather_idx: torch.Tensor | None = None,
+    padded_grouped_idx: torch.Tensor | None = None,
+) -> None:
+    """Build general-routing metadata, optionally including FP8 padded SFA maps."""
+    _general_routing_router_metadata_triton(
+        sorted_selected_T,
+        selected_E,
+        T,
+        E,
+        expert_frequency,
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        num_activated_expert_per_token_offset,
+        padded_gather_idx,
+        padded_grouped_idx,
     )
 
 

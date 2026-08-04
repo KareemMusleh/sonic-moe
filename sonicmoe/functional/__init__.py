@@ -17,9 +17,12 @@ from .backward import (
     _up_projection_backward_act,
 )
 from .forward import _router_forward, _topk_softmax_fwd
-from .forward_fp8 import moe_TC_softmax_topk_layer_fp8
+from .forward_fp8 import moe_general_routing_inputs_fp8, moe_TC_softmax_topk_layer_fp8
 from .fp8_tensor import FP8BlockwiseTensor
-from .triton_kernels import TC_topk_router_metadata_triton, general_routing_router_metadata_triton
+from .triton_kernels import (
+    TC_topk_router_metadata_triton,
+    general_routing_router_metadata_triton,
+)
 
 
 class _UpProjection(torch.autograd.Function):
@@ -50,7 +53,9 @@ class _UpProjection(torch.autograd.Function):
 
         a = torch.empty(TK, I, dtype=x.dtype, device=x.device)
         h = (
-            torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
+            torch.empty(
+                TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device
+            )
             if (not is_inference_mode_enabled)
             else None
         )
@@ -58,7 +63,9 @@ class _UpProjection(torch.autograd.Function):
         assert activation_type.value in (
             "swiglu",
             "geglu",
-        ), f"QuACK gemm_gated only supports glu activations, got {activation_type.value}"
+        ), (
+            f"QuACK gemm_gated only supports glu activations, got {activation_type.value}"
+        )
         gemm_gated(
             x,
             w1.permute(2, 1, 0),
@@ -69,7 +76,9 @@ class _UpProjection(torch.autograd.Function):
             postact_out=a,
             store_preact=(not is_inference_mode_enabled),
             bias=b1,
-            concat_layout=(("B", "bias") if b1 is not None else ("B",)) if concat_layout else None,
+            concat_layout=(("B", "bias") if b1 is not None else ("B",))
+            if concat_layout
+            else None,
         )
 
         ctx.T = T
@@ -78,7 +87,9 @@ class _UpProjection(torch.autograd.Function):
         ctx.K = K
         ctx.H = H
         ctx.I = I
-        ctx.is_each_token_has_variable_activated_experts = is_each_token_has_variable_activated_experts
+        ctx.is_each_token_has_variable_activated_experts = (
+            is_each_token_has_variable_activated_experts
+        )
         ctx.is_glu_activation = is_glu_activation
         ctx.concat_layout = concat_layout
 
@@ -105,7 +116,9 @@ class _UpProjection(torch.autograd.Function):
         K = ctx.K
         H = ctx.H
         is_glu_activation = ctx.is_glu_activation
-        is_each_token_has_variable_activated_experts = ctx.is_each_token_has_variable_activated_experts
+        is_each_token_has_variable_activated_experts = (
+            ctx.is_each_token_has_variable_activated_experts
+        )
         concat_layout = ctx.concat_layout
 
         (
@@ -182,7 +195,9 @@ class _DownProjection(torch.autograd.Function):
 
         y = torch.empty(TK, H, dtype=a.dtype, device=a.device)
 
-        gemm(a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=expert_frequency_offset, bias=b2)
+        gemm(
+            a, w2.permute(2, 1, 0), out=y, cu_seqlens_m=expert_frequency_offset, bias=b2
+        )
 
         o = torch.empty(T, H, device=a.device, dtype=a.dtype)
         topk_scores = topk_scores.view(-1)
@@ -290,9 +305,9 @@ def moe_TC_softmax_topk_layer(
     norm_topk_probs: bool = False,
     concat_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert ((b1 is None) and (b2 is None)) or (
-        (b1 is not None) and (b2 is not None)
-    ), "b1 and b2 has to be None or not None at the same time!"
+    assert ((b1 is None) and (b2 is None)) or ((b1 is not None) and (b2 is not None)), (
+        "b1 and b2 has to be None or not None at the same time!"
+    )
     E = router_w.size(0)
     router_logits = F.linear(x, router_w)
     topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(
@@ -310,7 +325,15 @@ def moe_TC_softmax_topk_layer(
     x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
 
     TC_topk_router_metadata_triton(
-        topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx, None, None
+        topk_indices,
+        E,
+        expert_frequency,
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        None,
+        None,
     )
 
     if isinstance(activation_type, str):
@@ -382,9 +405,9 @@ def moe_general_routing_inputs(
     is_inference_mode_enabled: bool = False,
     concat_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    assert ((b1 is None) and (b2 is None)) or (
-        (b1 is not None) and (b2 is not None)
-    ), "b1 and b2 has to be None or not None at the same time!"
+    assert ((b1 is None) and (b2 is None)) or ((b1 is not None) and (b2 is not None)), (
+        "b1 and b2 has to be None or not None at the same time!"
+    )
 
     T = x.size(0)
     TK = router_scores.size(0)
@@ -399,7 +422,9 @@ def moe_general_routing_inputs(
     expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
     expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
     x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
-    num_activated_expert_per_token_offset = torch.empty(T + 1, dtype=torch.int32, device=device)
+    num_activated_expert_per_token_offset = torch.empty(
+        T + 1, dtype=torch.int32, device=device
+    )
 
     general_routing_router_metadata_triton(
         token_indices,

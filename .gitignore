@@ -204,6 +204,19 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Local benchmark worktrees and vendored experiments
+/quack_bench/
+/sonicmoe_bench/
+/third_party/
+
+# Profiling and crash artifacts
+/scratchpad/
+*.ncu-rep
+/core
+
+# Local environments
+/.venv-*/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

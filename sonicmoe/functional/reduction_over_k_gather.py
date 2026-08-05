@@ -18,7 +18,11 @@ def _get_triton_autotune_configs() -> list[triton.Config]:
             for num_warps in [4, 8]:
                 if BLOCK_K * BLOCK_H <= 32768:
                     configs.append(
-                        triton.Config({"BLOCK_H": BLOCK_H, "BLOCK_K": BLOCK_K}, num_warps=num_warps, num_stages=4)
+                        triton.Config(
+                            {"BLOCK_H": BLOCK_H, "BLOCK_K": BLOCK_K},
+                            num_warps=num_warps,
+                            num_stages=4,
+                        )
                     )
     return configs
 
@@ -45,7 +49,7 @@ def _prune_triton_autotune_config(configs, nargs, **kw):
 
 @triton.autotune(
     configs=_get_triton_autotune_configs(),
-    key=["H", "MAX_K", "w_is_None", "is_varlen_K"],
+    key=["H", "MAX_K", "w_is_None", "is_varlen_K", "fixed_inverse_offsets"],
     prune_configs_by={"early_config_prune": _prune_triton_autotune_config},
 )
 @triton.jit
@@ -68,13 +72,18 @@ def token_gather_sum_kernel(
     BLOCK_K: tl.constexpr,
     w_is_None: tl.constexpr,
     is_varlen_K: tl.constexpr,
+    fixed_inverse_offsets: tl.constexpr,
+    packed_rows,
 ):
     # 1D tiling over T only
     pid_t = tl.program_id(axis=0)
     t_idx = pid_t.to(tl.int64)
 
     # Load segment starts and ends for this token
-    if is_varlen_K:
+    if fixed_inverse_offsets:
+        Ms = MAX_K * t_idx
+        K_this_token: tl.constexpr = MAX_K
+    elif is_varlen_K:
         Ms = tl.load(M_offset_ptr + t_idx).to(tl.int64)
         Me = tl.load(M_offset_ptr + t_idx + 1).to(tl.int64)
         K_this_token = Me - Ms  # actual K for this token
@@ -103,7 +112,11 @@ def token_gather_sum_kernel(
             m_abs = Ms + k_idx  # [BLOCK_K]
 
             # Gather permuted indices
-            perm_idx = tl.load(M_perm_ptr + m_abs, mask=m_k, other=0).to(tl.int64)  # [BLOCK_K]
+            perm_idx = tl.load(M_perm_ptr + m_abs, mask=m_k, other=packed_rows).to(
+                tl.int64
+            )  # [BLOCK_K]
+            if fixed_inverse_offsets:
+                m_k &= perm_idx < packed_rows
 
             # Load x values: [BLOCK_K, BLOCK_H]
             x_ptrs = x_ptr + perm_idx[:, None] * stride_xM + h_idx[None, :] * stride_xH
@@ -114,7 +127,9 @@ def token_gather_sum_kernel(
             if w_is_None:
                 acc += tl.sum(x_vals, axis=0)  # [BLOCK_H]
             else:
-                w_vals = tl.load(w_ptr + m_abs, mask=m_k, other=0.0).to(tl.float32)  # [BLOCK_K]
+                w_vals = tl.load(w_ptr + m_abs, mask=m_k, other=0.0).to(
+                    tl.float32
+                )  # [BLOCK_K]
                 acc += tl.sum(x_vals * w_vals[:, None], axis=0)  # [BLOCK_H]
 
         # Store final result for this H tile (only once!)
@@ -132,6 +147,7 @@ def token_gather_and_sum_varlen_K_triton(
     MAX_K: int,  # maximum K across all tokens
     H: int,
     is_varlen_K: bool,
+    fixed_inverse_offsets: bool = False,
 ):
     """
     1D parallelization over T, with iterative accumulation over K tiles and H tiles.
@@ -158,4 +174,6 @@ def token_gather_and_sum_varlen_K_triton(
         stride_outH=out.stride(1),
         w_is_None=(w is None),
         is_varlen_K=is_varlen_K,
+        fixed_inverse_offsets=fixed_inverse_offsets,
+        packed_rows=x.shape[0],
     )
